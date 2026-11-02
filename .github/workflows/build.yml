@@ -1,0 +1,226 @@
+name: GL-MT1300 Cloud Build (OpenWrt + GL layer)
+
+# 触发: push 或手动
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      OPENWRT_BRANCH:
+        description: 'OpenWrt branch: v22.03.4 or openwrt-25.12 (kernel 6.12)'
+        default: 'v22.03.4'
+        type: string
+      GL_MODULES:
+        description: 'GL kernel modules: source (compile, upgradeable) or original (prebuilt .ko, locked)'
+        default: 'source'
+        type: choice
+        options:
+          - source
+          - original
+      CLEAN_CLOUD:
+        description: 'Remove GL.iNet cloud (GoodCloud/rtty): off (keep) or on (cloud-free)'
+        default: 'off'
+        type: choice
+        options:
+          - 'off'
+          - 'on'
+      GL_BUILD_VARIANT:
+        description: 'standard (inject GL layer/nginx/ABI) | v1 (原b3更名, 25.12全官方+GL22 WiFi/USB移植) | v1.1 (V1 + 全LuCI功能 + GL用户态迁移) | clean (GL22去GL模块, 只留稳定WiFi/USB). 注意: 不能用 BUILD_VARIANT (OpenWrt 保留变量名)'
+        default: 'standard'
+        type: choice
+        options:
+          - standard
+          - v1
+          - v1.1
+          - clean
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      OPENWRT_BRANCH: ${{ github.event.inputs.OPENWRT_BRANCH || 'v22.03.4' }}
+      GL_MODULES: ${{ github.event.inputs.GL_MODULES || 'source' }}
+      CLEAN_CLOUD: ${{ github.event.inputs.CLEAN_CLOUD || 'off' }}
+      GL_BUILD_VARIANT: ${{ github.event.inputs.GL_BUILD_VARIANT || 'v1.1' }}
+
+    steps:
+      # ---- 1. 检出本仓库(含 config.build / gl-layer.tar.gz / gl-sdk4-modules / 补丁) ----
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---- 2. 安装 OpenWrt 构建依赖 ----
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            ack binutils bzip2 diffutils flex gawk gcc-multilib g++-multilib \
+            gettext git grep libncurses5-dev libssl-dev libelf-dev libz-dev \
+            locales make patch perl python3 python3-dev python3-pip \
+            python3-setuptools python3-yaml rsync sed tar unzip wget file \
+            zlib1g-dev gzip xz-utils pkg-config squashfs-tools
+          sudo locale-gen en_US.UTF-8
+
+      # ---- 3. 克隆 OpenWrt ----
+      - name: Clone OpenWrt
+        run: |
+          # 根据 OPENWRT_BRANCH 推导 feeds 分支
+          if [[ "$OPENWRT_BRANCH" == *"25"* ]]; then
+            FEED_BRANCH="openwrt-25.12"
+          else
+            FEED_BRANCH="openwrt-22.03"
+          fi
+          echo "OpenWrt=$OPENWRT_BRANCH  feeds=$FEED_BRANCH"
+          git clone --depth 1 -b "$OPENWRT_BRANCH" https://github.com/openwrt/openwrt.git
+          cd openwrt
+          ./scripts/feeds update -a
+          # 关键补丁: 给 nginx 包加 --with-http_gzip_static_module (原厂有, 标准包没有)
+          bash "$GITHUB_WORKSPACE/patch-nginx-gzipstatic.sh" feeds/packages
+          ./scripts/feeds install -a
+
+      # ---- 4. 放入 GL 内核模块包(自己编译或原厂 .ko) ----
+      - name: Add GL module package
+        run: |
+          cp -r "$GITHUB_WORKSPACE/gl-sdk4-modules" openwrt/package/gl-sdk4-modules
+          echo "=== gl-sdk4-modules 包已放入 ==="
+          ls openwrt/package/gl-sdk4-modules/
+          ls openwrt/package/gl-sdk4-modules/src/
+
+      # ---- 5. 配置(复刻原厂 GL 架构: 标准 Lua 5.1 + nginx-ubus + GL 内核模块) ----
+      - name: Configure
+        run: |
+          # 选择 config: V1(25.12全官方+GL22 WiFi/USB) / V1.1(V1+全LuCI+GL用户态) / clean(GL22去GL模块) / 25.12 适配版 / 22.03 原版
+          if [ "$GL_BUILD_VARIANT" = "v1" ]; then
+            cp "$GITHUB_WORKSPACE/config-v1.build" openwrt/.config
+            echo "=== V1: 25.12 全官方 + GL22 稳定 WiFi/USB 移植 ==="
+          elif [ "$GL_BUILD_VARIANT" = "v1.1" ]; then
+            cp "$GITHUB_WORKSPACE/config-v1.1.build" openwrt/.config
+            echo "=== V1.1: 25.12 + 全LuCI功能(映射GL UI 30菜单) + GL用户态迁移 + 硬件加速 ==="
+          elif [ "$GL_BUILD_VARIANT" = "clean" ]; then
+            cp "$GITHUB_WORKSPACE/config-22.03-clean.build" openwrt/.config
+            echo "=== GL22 干净版: 去 GL 模块, 只留稳定 WiFi/USB ==="
+          elif [[ "$OPENWRT_BRANCH" == *"25"* ]]; then
+            cp "$GITHUB_WORKSPACE/config-25.12.build" openwrt/.config
+          else
+            cp "$GITHUB_WORKSPACE/config.build" openwrt/.config
+          fi
+          cd openwrt
+          # 若用原厂 .ko, 关闭源码包(避免冲突), 仅保留注入
+          if [ "$GL_MODULES" = "original" ]; then
+            echo "CONFIG_PACKAGE_kmod-gl-sdk4-hw-info=n" >> .config
+            echo "CONFIG_PACKAGE_kmod-gl-sdk4-tertf=n" >> .config
+          fi
+          make defconfig
+          echo "=== 关键配置验证 ==="
+          grep -E "CONFIG_TARGET_ramips_mt7621_DEVICE_glinet_gl-mt1300|CONFIG_NGINX_LUA|CONFIG_NGINX_UBUS|CONFIG_PACKAGE_kmod-gl-sdk4|CONFIG_NET_MEDIATEK_SOC|CONFIG_PACKAGE_kmod-nf-flow|CONFIG_PACKAGE_kmod-ipt-offload|CONFIG_PACKAGE_kmod-nft-offload" .config | head
+
+      # ---- 6. 注入原厂 GL 层(黑盒组件, 复用原厂二进制) / V1 全官方 / clean 无GL ----
+      - name: Inject GL layer
+        run: |
+          mkdir -p openwrt/files
+          if [ "$GL_BUILD_VARIANT" = "v1" ]; then
+            echo "=== V1: 全官方层, 不注入 GL 层/nginx/ABI ==="
+            # V1: 仅注入 HNAT 硬件加速 uci-defaults
+            mkdir -p openwrt/files/etc/uci-defaults
+            cp "$GITHUB_WORKSPACE/b3-enable-hnat.sh" openwrt/files/etc/uci-defaults/99-b3-hnat
+            chmod +x openwrt/files/etc/uci-defaults/99-b3-hnat
+            echo "--- 注入 HNAT 脚本 ---"
+            cat openwrt/files/etc/uci-defaults/99-b3-hnat
+          elif [ "$GL_BUILD_VARIANT" = "v1.1" ]; then
+            echo "=== V1.1: 全官方层 + GL 用户态迁移(纯shell/Lua, 无闭源.so) ==="
+            # V1.1: 注入 GL 用户态(gl_util.sh/modem_manager.lua/gl_s2s/network_gl等)
+            # tar 已按正确路径打包(lib/functions/, etc/uci-defaults/, etc/init.d/, etc/config/, usr/bin/)
+            # 这些是纯 shell/Lua 源码, 可跨 ABI; 闭源 .so(modem.so/glog.so)不迁
+            mkdir -p openwrt/files/etc/uci-defaults
+            cp "$GITHUB_WORKSPACE/b3-enable-hnat.sh" openwrt/files/etc/uci-defaults/99-b3-hnat
+            chmod +x openwrt/files/etc/uci-defaults/99-b3-hnat
+            tar xzf "$GITHUB_WORKSPACE/gl-userland-migrate.tar.gz" -C openwrt/files
+            # 确保可执行权限
+            chmod +x openwrt/files/etc/init.d/modem_auto openwrt/files/etc/init.d/modem_signal openwrt/files/etc/init.d/gl_s2s 2>/dev/null
+            chmod +x openwrt/files/usr/bin/modem_signal openwrt/files/usr/bin/modem_upgrade_check 2>/dev/null
+            echo "--- 注入 GL 用户态文件 ---"
+            find openwrt/files -type f | sort
+          elif [ "$GL_BUILD_VARIANT" = "clean" ]; then
+            echo "=== GL22 干净版: 无 GL 层, 不注入(用官方默认防火墙) ==="
+          else
+            tar xzf "$GITHUB_WORKSPACE/gl-layer.tar.gz" -C openwrt/files
+            # ---- 注入原厂 ABI 库(原厂 GL 二进制硬依赖 22.03 ABI) ----
+            # 25.12 的 libubus=20251202, 原厂需 20220601 => 必须注入原厂库
+            # liblua 5.1.5 是原厂定制(double int32), 标准版无法加载 validator 字节码
+            echo "=== 注入原厂 ABI 库 ==="
+            tar xzf "$GITHUB_WORKSPACE/gl-abi-libs.tar.gz" -C openwrt/files
+            # gl-libs/lib/* 平铺到 /lib, gl-libs/usr/lib/* 平铺到 /usr/lib
+            cp -f openwrt/files/gl-libs/lib/* openwrt/files/lib/ 2>/dev/null
+            cp -f openwrt/files/gl-libs/usr/lib/* openwrt/files/usr/lib/ 2>/dev/null
+            rm -rf openwrt/files/gl-libs
+            echo "--- 注入后 /lib ---"
+            ls -la openwrt/files/lib/libubus* openwrt/files/lib/libubox* 2>/dev/null
+            echo "--- 注入后 /usr/lib 关键库 ---"
+            ls -la openwrt/files/usr/lib/liblua* openwrt/files/usr/lib/libssl* openwrt/files/usr/lib/libjson-c* openwrt/files/usr/lib/libpcre* 2>/dev/null
+            # ---- 25.12: 注入原厂 nginx(标准 Lua5.1 静态编译, 官方 25.12 是 LuaJIT) ----
+            if [[ "$OPENWRT_BRANCH" == *"25"* ]]; then
+              echo "=== 注入原厂 nginx(25.12, 官方是 LuaJIT 不兼容) ==="
+              tar xzf "$GITHUB_WORKSPACE/gl-nginx-bin.tar.gz" -C openwrt/files
+              # 平铺到正确位置
+              cp -f openwrt/files/gl-nginx/usr/sbin/nginx openwrt/files/usr/sbin/nginx 2>/dev/null
+              chmod +x openwrt/files/usr/sbin/nginx 2>/dev/null
+              rm -rf openwrt/files/gl-nginx
+              ls -la openwrt/files/usr/sbin/nginx
+            fi
+            # 若用原厂 .ko, 直接注入到内核模块目录(仅 22.03 内核 5.10.176 匹配)
+            if [ "$GL_MODULES" = "original" ]; then
+              KO_DIR="openwrt/files/lib/modules/5.10.176"
+              mkdir -p "$KO_DIR"
+              cp "$GITHUB_WORKSPACE/gl-sdk4-modules/original/"*.ko "$KO_DIR/"
+              echo "=== 注入原厂 .ko ==="
+              ls -la "$KO_DIR/"*.ko
+            fi
+            # 若要去原厂云, 移除 gl-cloud/rtty 组件
+            if [ "$CLEAN_CLOUD" = "on" ]; then
+              echo "=== 去原厂云(CLEAN_CLOUD=on) ==="
+              bash "$GITHUB_WORKSPACE/clean-cloud.sh" openwrt/files
+            fi
+          fi
+          echo "=== 注入文件数 ==="
+          find openwrt/files -type f | wc -l
+
+      # ---- 6.5 构建前释放磁盘(runner 默认 ~14GB, 22.03+GL层+GL SDK4源码编译会耗尽) ----
+      - name: Free disk space
+        run: |
+          echo "=== 构建前磁盘 ==="
+          df -h / | tail -1
+          sudo rm -rf /usr/share/doc/* /usr/share/man/* /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* 2>/dev/null || true
+          sudo apt-get clean 2>/dev/null || true
+          echo "=== 清理后磁盘 ==="
+          df -h / | tail -1
+
+      # ---- 7. 构建(核心步骤) ----
+      # -j2: 降并发减少峰值临时文件(standard 变体曾因 -j$(nproc) 磁盘满失败)
+      - name: Build firmware
+        run: |
+          set -o pipefail
+          cd openwrt
+          if [ "$GL_MODULES" = "original" ]; then
+            make -j2 V=s 2>&1 | tee build.log
+          else
+            make GL_MODULES_BUILD=source -j2 V=s 2>&1 | tee build.log
+          fi
+
+      # ---- 8. 上传固件产物 ----
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: gl-mt1300-firmware
+          path: |
+            openwrt/bin/targets/ramips/mt7621/*.bin
+            openwrt/bin/targets/ramips/mt7621/*.itb
+            openwrt/build.log
+          if-no-files-found: error
+
+      # ---- 9. 失败时上传日志(便于排查) ----
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: openwrt/build.log
